@@ -1,0 +1,176 @@
+<!doctype html>
+<html lang="om">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>T4F 369 Phases Scanner</title>
+<style>
+*{box-sizing:border-box}
+body{margin:0;background:#0d1117;color:#c9d1d9;font:14px system-ui,sans-serif}
+header{padding:10px 12px;background:#161b22;border-bottom:1px solid #30363d}
+h1{font-size:16px;margin:0 0 8px}
+.ctl{display:flex;flex-wrap:wrap;gap:8px;align-items:end}
+label{display:flex;flex-direction:column;font-size:11px;color:#8b949e;gap:2px}
+input,select{background:#0d1117;color:#c9d1d9;border:1px solid #30363d;border-radius:6px;padding:6px;width:96px}
+input[type=checkbox]{width:auto}
+button{background:#238636;color:#fff;border:0;border-radius:6px;padding:8px 14px;font-weight:600;cursor:pointer}
+#chart{height:52vh;min-height:320px}
+#banner{padding:10px 12px;font-weight:700}
+.go{background:#1a7f37;color:#fff}.wait{background:#161b22;color:#8b949e}
+#stats{padding:6px 12px;color:#8b949e}
+.wrap{overflow-x:auto;padding:0 12px 24px}
+table{border-collapse:collapse;width:100%;min-width:620px}
+th,td{padding:6px 8px;border-bottom:1px solid #21262d;text-align:left;white-space:nowrap}
+th{color:#8b949e;font-weight:600}
+.L{color:#3fb950}.S{color:#f85149}.W{color:#3fb950}.X{color:#f85149}.O{color:#d29922}
+</style>
+</head>
+<body>
+<header>
+<h1>T4F 369 Phases Scanner (True Day Open 00:00 / True London Open 02:22, NY time)</h1>
+<div class="ctl">
+<label>Symbol<input id="sym" value="BTCUSDT" list="syms"><datalist id="syms"><option>BTCUSDT<option>ETHUSDT<option>SOLUSDT<option>BNBUSDT<option>XRPUSDT<option>PAXGUSDT</datalist></label>
+<label>Timeframe<select id="iv"><option>1m<option>3m<option selected>5m<option>15m</select></label>
+<label>HTF (FVG)<select id="htf"><option selected>1h<option>4h</select></label>
+<label>Phase (min)<input id="ph" type="number" value="30" min="5"></label>
+<label>Tap → CISD (bars)<input id="tap" type="number" value="10" min="1"></label>
+<label>STDV target<input id="stdv" type="number" value="2" step="0.5"></label>
+<label>Prem/Disc filter<input id="filt" type="checkbox" checked></label>
+<label>Auto refresh 60s<input id="auto" type="checkbox" checked></label>
+<button id="go">Load / Scan</button>
+</div>
+</header>
+<div id="banner" class="wait">Eegaa...</div>
+<div id="chart"></div>
+<div id="stats"></div>
+<div class="wrap"><table><thead><tr><th>Time</th><th>Side</th><th>Entry</th><th>Stop Loss</th><th>Take Profit</th><th>Result</th></tr></thead><tbody id="rows"></tbody></table></div>
+
+<script src="https://cdn.jsdelivr.net/npm/lightweight-charts@4.1.3/dist/lightweight-charts.standalone.production.js"></script>
+<script>
+const $=id=>document.getElementById(id);
+const IV={'1m':6e4,'3m':18e4,'5m':3e5,'15m':9e5,'1h':36e5,'4h':144e5};
+const BASES=['https://data-api.binance.vision','https://api.binance.com'];
+
+async function klines(sym,iv,limit){
+  for(const b of BASES){
+    try{
+      const r=await fetch(`${b}/api/v3/klines?symbol=${sym}&interval=${iv}&limit=${limit}`);
+      if(r.ok){const a=await r.json();return a.map(k=>({t:k[0],o:+k[1],h:+k[2],l:+k[3],c:+k[4]}));}
+    }catch(e){}
+  }
+  throw new Error('Data hin argamne. Symbol ykn network ilaali.');
+}
+
+const fmt=new Intl.DateTimeFormat('en-US',{timeZone:'America/New_York',hour12:false,year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit'});
+function ny(ms){const p={};fmt.formatToParts(ms).forEach(x=>p[x.type]=x.value);return{day:p.year+p.month+p.day,min:(+p.hour%24)*60+ +p.minute};}
+
+function run(C,H,o){
+  const hMs=IV[o.htf],fv=[];
+  for(let i=2;i<H.length;i++){
+    const a=H[i-2],b=H[i],av=b.t+hMs;           // known only after HTF candle closes
+    if(b.l>a.h)fv.push({dir:1,top:b.l,bot:a.h,av});
+    if(b.h<a.l)fv.push({dir:-1,top:a.l,bot:b.h,av});
+  }
+  let fp=0,zones=[],dayOpen=null,lonOpen=null,prevDay=null,prevMin=0;
+  let bro=null,brl=null,uro=null,urh=null,lastBull=-1e9,lastBear=-1e9,busy=null;
+  const sigs=[],dayL=[],lonL=[];
+  for(let i=0;i<C.length;i++){
+    const k=C[i],p=C[i-1],t=ny(k.t),sec=k.t/1000;
+    if(t.day!==prevDay){dayOpen=k.o;lonOpen=null;prevDay=t.day;}
+    if(t.min>=142&&prevMin<142)lonOpen=k.o;
+    prevMin=t.min;
+    if(dayOpen!=null)dayL.push({time:sec,value:dayOpen});
+    if(lonOpen!=null)lonL.push({time:sec,value:lonOpen});
+    const inWin=t.min>=142&&t.min<142+6*o.ph;
+
+    // manage open trade (SL checked first = conservative)
+    if(busy&&i>busy.i){
+      if(busy.side==='LONG'){
+        if(k.l<=busy.sl){busy.res='SL';busy=null;}
+        else if(k.h>=busy.tp){busy.res='TP';busy=null;}
+      }else{
+        if(k.h>=busy.sl){busy.res='SL';busy=null;}
+        else if(k.l<=busy.tp){busy.res='TP';busy=null;}
+      }
+      if(busy&&!inWin){busy.res=(busy.side==='LONG'?k.c-busy.entry:busy.entry-k.c)>=0?'EXIT+':'EXIT-';busy=null;}
+    }
+
+    // STEP 3: HTF FVG zones
+    while(fp<fv.length&&fv[fp].av<=k.t){zones.push(fv[fp]);fp++;}
+    zones=zones.filter(z=>z.dir===1?k.c>=z.bot:k.c<=z.top).slice(-30);
+    if(zones.some(z=>z.dir===1&&k.l<=z.top&&k.h>=z.bot))lastBull=i;
+    if(zones.some(z=>z.dir===-1&&k.h>=z.bot&&k.l<=z.top))lastBear=i;
+
+    // STEP 4: CISD
+    if(k.c<k.o){if(!(p&&p.c<p.o)){bro=k.o;brl=k.l;}else brl=Math.min(brl,k.l);}
+    if(k.c>k.o){if(!(p&&p.c>p.o)){uro=k.o;urh=k.h;}else urh=Math.max(urh,k.h);}
+    const bullC=bro!=null&&p&&k.c>bro&&p.c<=bro;
+    const bearC=uro!=null&&p&&k.c<uro&&p.c>=uro;
+    const disc=!o.filt||(lonOpen!=null&&k.c<lonOpen);
+    const prem=!o.filt||(lonOpen!=null&&k.c>lonOpen);
+
+    // STEP 5: STDV targets + entry
+    if(!busy&&inWin){
+      if(bullC&&i-lastBull<=o.tap&&disc){
+        const sl=brl,tp=bro+o.stdv*(bro-brl);
+        if(sl<k.c&&tp>k.c){busy={i,time:sec,side:'LONG',entry:k.c,sl,tp,res:'OPEN'};sigs.push(busy);}
+      }else if(bearC&&i-lastBear<=o.tap&&prem){
+        const sl=urh,tp=uro-o.stdv*(urh-uro);
+        if(sl>k.c&&tp<k.c){busy={i,time:sec,side:'SHORT',entry:k.c,sl,tp,res:'OPEN'};sigs.push(busy);}
+      }
+    }
+  }
+  return{sigs,dayL,lonL};
+}
+
+// ---------- chart ----------
+const chart=LightweightCharts.createChart($('chart'),{
+  layout:{background:{color:'#0d1117'},textColor:'#c9d1d9'},
+  grid:{vertLines:{color:'#161b22'},horzLines:{color:'#161b22'}},
+  timeScale:{timeVisible:true,secondsVisible:false},autoSize:true});
+const cs=chart.addCandlestickSeries();
+const dayS=chart.addLineSeries({color:'#f0883e',lineWidth:1,lastValueVisible:false,priceLineVisible:false,title:'Day Open'});
+const lonS=chart.addLineSeries({color:'#39c5cf',lineWidth:1,lastValueVisible:false,priceLineVisible:false,title:'London Open'});
+let plines=[];
+
+const f=n=>n>=100?n.toFixed(2):n.toFixed(5);
+
+async function load(){
+  const b=$('banner');b.className='wait';b.textContent='Data fidhaa jira...';
+  try{
+    const o={iv:$('iv').value,htf:$('htf').value,ph:+$('ph').value,tap:+$('tap').value,stdv:+$('stdv').value,filt:$('filt').checked};
+    const sym=$('sym').value.trim().toUpperCase();
+    const [C,H]=await Promise.all([klines(sym,o.iv,1000),klines(sym,o.htf,1000)]);
+    const r=run(C,H,o);
+    cs.setData(C.map(k=>({time:k.t/1000,open:k.o,high:k.h,low:k.l,close:k.c})));
+    dayS.setData(r.dayL);lonS.setData(r.lonL);
+    cs.setMarkers(r.sigs.map(s=>({time:s.time,position:s.side==='LONG'?'belowBar':'aboveBar',
+      color:s.side==='LONG'?'#3fb950':'#f85149',shape:s.side==='LONG'?'arrowUp':'arrowDown',text:s.side})));
+    plines.forEach(l=>cs.removePriceLine(l));plines=[];
+    const last=r.sigs[r.sigs.length-1];
+    if(last&&last.res==='OPEN'){
+      [['Entry',last.entry,'#c9d1d9'],['SL',last.sl,'#f85149'],['TP',last.tp,'#3fb950']].forEach(([t,p,c])=>
+        plines.push(cs.createPriceLine({price:p,color:c,lineWidth:1,lineStyle:2,title:t})));
+    }
+    // table
+    $('rows').innerHTML=r.sigs.slice().reverse().map(s=>{
+      const cls=s.res==='TP'||s.res==='EXIT+'?'W':s.res==='OPEN'?'O':'X';
+      return `<tr><td>${new Date(s.time*1000).toLocaleString()}</td><td class="${s.side==='LONG'?'L':'S'}">${s.side}</td><td>${f(s.entry)}</td><td>${f(s.sl)}</td><td>${f(s.tp)}</td><td class="${cls}">${s.res}</td></tr>`;
+    }).join('')||'<tr><td colspan="6">Entry hin argamne.</td></tr>';
+    const done=r.sigs.filter(s=>s.res!=='OPEN'),w=done.filter(s=>s.res==='TP'||s.res==='EXIT+').length;
+    $('stats').textContent=`Entry: ${r.sigs.length} | Xumurame: ${done.length} | Injifannoo: ${w} | Win rate: ${done.length?(w/done.length*100).toFixed(1):'-'}%`;
+    // banner
+    const lastBarSec=C[C.length-1].t/1000,ivS=IV[o.iv]/1000;
+    if(last&&lastBarSec-last.time<=ivS*2&&last.res==='OPEN'){
+      b.className='go';b.textContent=`ENTRY ${last.side} @ ${f(last.entry)} | SL ${f(last.sl)} | TP ${f(last.tp)}`;
+    }else if(last&&last.res==='OPEN'){
+      b.className='go';b.textContent=`Trade banaa: ${last.side} @ ${f(last.entry)} | SL ${f(last.sl)} | TP ${f(last.tp)}`;
+    }else{b.className='wait';b.textContent='Amma entry hin jiru. Setup eegaa (FVG tap + CISD, London window keessatti).';}
+  }catch(e){b.className='wait';b.textContent='Dogoggora: '+e.message;}
+}
+$('go').onclick=load;
+setInterval(()=>{if($('auto').checked)load();},60000);
+load();
+</script>
+</body>
+</html>
